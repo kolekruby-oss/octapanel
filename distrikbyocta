@@ -1,0 +1,2173 @@
+--[[
+	Player Utility Panel (LocalScript)
+	Letak: StarterPlayer > StarterPlayerScripts
+	Fitur: Fly, Swim, Speed, Super Jump, Noclip, Freecam, Hide GUI, Teleport ke player lain,
+		Semua jalan di client saja. Hide/show panel: RightShift
+	Style UI: gelap + gradient merah (Workspace["SALON MUSIC BY OCTA"].TEAMS.Merah).
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local StarterGui = game:GetService("StarterGui")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+---------------------------------------------------------------------
+-- CONFIG
+---------------------------------------------------------------------
+local DEFAULT_VALUES = {
+	FlySpeed = 60,
+	WalkSpeed = 50,
+	JumpPower = 120,
+	SwimSpeed = 40,
+	FreecamSpeed = 40,
+}
+local VALUE_MIN, VALUE_MAX = 1, 500
+local TOGGLE_PANEL_KEY = Enum.KeyCode.RightShift
+local TELEPORT_OFFSET = CFrame.new(0, 2, 4) -- relatif ke target (4 stud di belakang)
+
+-- true  = badan avatar ikut miring sesuai arah kamera (naik/turun/belok)
+-- false = avatar hanya menghadap arah kamera secara horizontal
+local FLY_TILT_WITH_CAMERA = true
+
+local FREECAM = {
+	LookDamping = 7, -- makin kecil = kamera meluncur makin lama setelah mouse berhenti
+	LookPerPixel = 0.003, -- radian per pixel mouse (total, setelah inertia selesai)
+	MoveSmooth = 7, -- makin kecil = gerak kamera meluncur makin lama
+	ZoomSmooth = 10,
+	ZoomStep = 0.88, -- tiap notch scroll
+	FovMin = 5,
+	FovMax = 120,
+	FastKey = Enum.KeyCode.LeftShift,
+	FastMultiplier = 3,
+	UpKeys = { Enum.KeyCode.Space, Enum.KeyCode.E },
+	DownKeys = { Enum.KeyCode.LeftControl, Enum.KeyCode.Q },
+}
+
+-- GUI yang tidak ikut disembunyikan oleh Hide GUI
+local KEEP_VISIBLE_GUIS = { PlayerUtilityPanel = true, TouchGui = true }
+
+-- Asset yang diambil dari UI Inventory
+local ASSETS = {
+	Icon = "rbxassetid://87984575377587",
+	Pattern = "rbxassetid://85409521137338",
+	Studs = "rbxassetid://10509779001",
+	Search = "rbxassetid://128971822092362",
+}
+
+---------------------------------------------------------------------
+-- STATE
+---------------------------------------------------------------------
+local enabled = {
+	Fly = false, Swim = false, Speed = false, Jump = false,
+	Noclip = false, Freecam = false, HideGui = false, Cursor = false,
+}
+local values = table.clone(DEFAULT_VALUES)
+local original = { WalkSpeed = 16, JumpPower = 50, UseJumpPower = true }
+
+local character, humanoid, rootPart
+local mover -- { attachment, velocity, align? } dipakai Fly & Swim
+local noclipCache = {}
+local controls
+
+local freecam = {
+	active = false,
+	pos = Vector3.zero,
+	yaw = 0, pitch = 0,
+	yawVel = 0, pitchVel = 0,
+	vel = Vector3.zero,
+	fov = 70, targetFov = 70,
+	prevFov = 70,
+	prevType = Enum.CameraType.Custom,
+	rmb = false,
+	pinchBase = 70,
+	frozenRoot = nil,
+	wasAnchored = false,
+}
+
+local hideGui = { saved = {}, conns = {}, childConn = nil, core = nil, world = {}, worldConn = nil }
+
+-- Ambil ControlModule bawaan Roblox (support keyboard, gamepad, mobile)
+task.spawn(function()
+	local ok, result = pcall(function()
+		local playerScripts = player:WaitForChild("PlayerScripts")
+		return require(playerScripts:WaitForChild("PlayerModule", 15)):GetControls()
+	end)
+	if ok then
+		controls = result
+	end
+end)
+
+---------------------------------------------------------------------
+-- INPUT HELPERS
+---------------------------------------------------------------------
+local function anyKeyDown(keys)
+	for _, key in ipairs(keys) do
+		if UserInputService:IsKeyDown(key) then
+			return true
+		end
+	end
+	return false
+end
+
+-- Vektor gerak relatif kamera (x = kanan, z = maju negatif), dari WASD / thumbstick
+local function getMoveVector(): Vector3
+	if controls then
+		local ok, v = pcall(controls.GetMoveVector, controls)
+		if ok and typeof(v) == "Vector3" then
+			return v
+		end
+	end
+	if UserInputService:GetFocusedTextBox() then
+		return Vector3.zero
+	end
+	local x = (UserInputService:IsKeyDown(Enum.KeyCode.D) and 1 or 0) - (UserInputService:IsKeyDown(Enum.KeyCode.A) and 1 or 0)
+	local z = (UserInputService:IsKeyDown(Enum.KeyCode.S) and 1 or 0) - (UserInputService:IsKeyDown(Enum.KeyCode.W) and 1 or 0)
+	return Vector3.new(x, 0, z)
+end
+
+-- Arah terbang/renang: 100% dari kamera (termasuk pitch), jadi lihat atas = naik, lihat bawah = turun
+local function getInputDirection(): Vector3
+	if enabled.Freecam then
+		return Vector3.zero
+	end
+	local cam = workspace.CurrentCamera
+	if not cam then
+		return Vector3.zero
+	end
+	local dir = cam.CFrame:VectorToWorldSpace(getMoveVector())
+	if dir.Magnitude > 1 then
+		dir = dir.Unit
+	end
+	return dir
+end
+
+---------------------------------------------------------------------
+-- MOVER (LinearVelocity) untuk Fly & Swim
+---------------------------------------------------------------------
+local function destroyMover()
+	if mover then
+		for _, inst in pairs(mover) do
+			inst:Destroy()
+		end
+		mover = nil
+	end
+end
+
+local function createMover(withAlign: boolean)
+	destroyMover()
+	if not rootPart then
+		return
+	end
+
+	local attachment = Instance.new("Attachment")
+	attachment.Name = "UtilityAttachment"
+	attachment.Parent = rootPart
+
+	local lv = Instance.new("LinearVelocity")
+	lv.Name = "UtilityVelocity"
+	lv.Attachment0 = attachment
+	lv.RelativeTo = Enum.ActuatorRelativeTo.World
+	lv.MaxForce = math.huge
+	lv.VectorVelocity = Vector3.zero
+	lv.Parent = rootPart
+
+	mover = { attachment = attachment, velocity = lv }
+
+	if withAlign then
+		local ao = Instance.new("AlignOrientation")
+		ao.Name = "UtilityAlign"
+		ao.Mode = Enum.OrientationAlignmentMode.OneAttachment
+		ao.Attachment0 = attachment
+		ao.MaxTorque = math.huge
+		ao.Responsiveness = 25
+		ao.Parent = rootPart
+		mover.align = ao
+	end
+end
+
+---------------------------------------------------------------------
+-- FREECAM HELPERS
+---------------------------------------------------------------------
+local function freezeCharacter()
+	if rootPart and freecam.frozenRoot ~= rootPart then
+		freecam.frozenRoot = rootPart
+		freecam.wasAnchored = rootPart.Anchored
+		rootPart.Anchored = true
+	end
+end
+
+local function unfreezeCharacter()
+	if freecam.frozenRoot then
+		if freecam.frozenRoot.Parent then
+			freecam.frozenRoot.Anchored = freecam.wasAnchored
+		end
+		freecam.frozenRoot = nil
+	end
+end
+
+local function addLookImpulse(dx: number, dy: number)
+	-- makin zoom-in makin pelan rotasinya
+	local scale = math.clamp(freecam.fov / 70, 0.15, 1.5)
+	local impulse = FREECAM.LookPerPixel * FREECAM.LookDamping * scale
+	freecam.yawVel -= dx * impulse
+	freecam.pitchVel -= dy * impulse
+end
+
+---------------------------------------------------------------------
+-- HIDE GUI HELPERS
+---------------------------------------------------------------------
+local function hideScreenGui(sg: ScreenGui)
+	if KEEP_VISIBLE_GUIS[sg.Name] or hideGui.saved[sg] ~= nil then
+		return
+	end
+	hideGui.saved[sg] = sg.Enabled
+	sg.Enabled = false
+	hideGui.conns[sg] = sg:GetPropertyChangedSignal("Enabled"):Connect(function()
+		-- kalau script game menyalakan lagi saat Hide GUI aktif, ingat lalu sembunyikan lagi
+		if enabled.HideGui and sg.Enabled then
+			hideGui.saved[sg] = true
+			sg.Enabled = false
+		end
+	end)
+end
+
+-- UI yang ada di dalam map: BillboardGui (nametag/overhead) dan SurfaceGui (layar di part)
+local function hideWorldGui(g: Instance)
+	if (g:IsA("BillboardGui") or g:IsA("SurfaceGui")) and hideGui.world[g] == nil then
+		hideGui.world[g] = g.Enabled
+		g.Enabled = false
+	end
+end
+
+---------------------------------------------------------------------
+-- FEATURES
+---------------------------------------------------------------------
+local features = {}
+
+function features.Fly(on: boolean)
+	if on then
+		if not (humanoid and rootPart) then
+			return
+		end
+		createMover(true)
+		humanoid.PlatformStand = true
+	else
+		destroyMover()
+		if humanoid then
+			humanoid.PlatformStand = false
+			humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+		end
+	end
+end
+
+function features.Swim(on: boolean)
+	if on then
+		if not (humanoid and rootPart) then
+			return
+		end
+		createMover(false)
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.Swimming, true)
+		humanoid:ChangeState(Enum.HumanoidStateType.Swimming)
+	else
+		destroyMover()
+		if humanoid then
+			humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+		end
+	end
+end
+
+function features.Speed(on: boolean)
+	if humanoid then
+		humanoid.WalkSpeed = on and values.WalkSpeed or original.WalkSpeed
+	end
+end
+
+function features.Jump(on: boolean)
+	if not humanoid then
+		return
+	end
+	if on then
+		humanoid.UseJumpPower = true
+		humanoid.JumpPower = values.JumpPower
+	else
+		humanoid.JumpPower = original.JumpPower
+		humanoid.UseJumpPower = original.UseJumpPower
+	end
+end
+
+-- Cursor: mouse dipaksa bebas + terlihat (berguna kalau game mengunci / menyembunyikan cursor)
+local cursorSaved = nil
+function features.Cursor(on: boolean)
+	if on then
+		cursorSaved = cursorSaved or { icon = UserInputService.MouseIconEnabled, behavior = UserInputService.MouseBehavior }
+	elseif cursorSaved then
+		UserInputService.MouseIconEnabled = cursorSaved.icon
+		UserInputService.MouseBehavior = cursorSaved.behavior
+		cursorSaved = nil
+	end
+end
+RunService.RenderStepped:Connect(function()
+	if enabled.Cursor then
+		UserInputService.MouseIconEnabled = true
+		if UserInputService.MouseBehavior ~= Enum.MouseBehavior.Default and not freecam.active then
+			UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+		end
+	end
+end)
+
+function features.Noclip(on: boolean)
+	if not on then
+		-- kembalikan hanya part yang tadi kita matikan collision-nya
+		for part in pairs(noclipCache) do
+			if part.Parent then
+				part.CanCollide = true
+			end
+		end
+		table.clear(noclipCache)
+	end
+end
+
+function features.Freecam(on: boolean)
+	if on then
+		if freecam.active then
+			freezeCharacter() -- dipanggil ulang saat respawn
+			return
+		end
+		local cam = workspace.CurrentCamera
+		if not cam then
+			return
+		end
+		freecam.active = true
+		freecam.prevType = cam.CameraType == Enum.CameraType.Scriptable and Enum.CameraType.Custom or cam.CameraType
+		freecam.prevFov = cam.FieldOfView
+		local rx, ry = cam.CFrame:ToOrientation()
+		freecam.pitch, freecam.yaw = rx, ry
+		freecam.pos = cam.CFrame.Position
+		freecam.yawVel, freecam.pitchVel = 0, 0
+		freecam.vel = Vector3.zero
+		freecam.fov, freecam.targetFov = cam.FieldOfView, cam.FieldOfView
+		cam.CameraType = Enum.CameraType.Scriptable
+		freezeCharacter()
+	else
+		if not freecam.active then
+			return
+		end
+		freecam.active = false
+		freecam.rmb = false
+		UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+		unfreezeCharacter()
+		local cam = workspace.CurrentCamera
+		if cam then
+			cam.FieldOfView = freecam.prevFov
+			cam.CameraType = freecam.prevType
+			if humanoid then
+				cam.CameraSubject = humanoid
+			end
+		end
+	end
+end
+
+function features.HideGui(on: boolean)
+	if on then
+		for _, child in ipairs(playerGui:GetChildren()) do
+			if child:IsA("ScreenGui") then
+				hideScreenGui(child)
+			end
+		end
+		if not hideGui.childConn then
+			hideGui.childConn = playerGui.ChildAdded:Connect(function(child)
+				if enabled.HideGui and child:IsA("ScreenGui") then
+					hideScreenGui(child)
+				end
+			end)
+		end
+		-- UI di dalam map (BillboardGui / SurfaceGui)
+		for _, inst in ipairs(workspace:GetDescendants()) do
+			hideWorldGui(inst)
+		end
+		if not hideGui.worldConn then
+			hideGui.worldConn = workspace.DescendantAdded:Connect(function(inst)
+				if enabled.HideGui then
+					hideWorldGui(inst)
+				end
+			end)
+		end
+		-- CoreGui (chat, leaderboard, backpack, dll)
+		if not hideGui.core then
+			hideGui.core = {}
+			for _, coreType in ipairs(Enum.CoreGuiType:GetEnumItems()) do
+				if coreType ~= Enum.CoreGuiType.All then
+					local ok, state = pcall(StarterGui.GetCoreGuiEnabled, StarterGui, coreType)
+					if ok then
+						hideGui.core[coreType] = state
+					end
+				end
+			end
+			pcall(StarterGui.SetCoreGuiEnabled, StarterGui, Enum.CoreGuiType.All, false)
+		end
+	else
+		if hideGui.childConn then
+			hideGui.childConn:Disconnect()
+			hideGui.childConn = nil
+		end
+		for sg, conn in pairs(hideGui.conns) do
+			conn:Disconnect()
+		end
+		table.clear(hideGui.conns)
+		for sg, wasEnabled in pairs(hideGui.saved) do
+			if sg.Parent then
+				sg.Enabled = wasEnabled
+			end
+		end
+		table.clear(hideGui.saved)
+		if hideGui.worldConn then
+			hideGui.worldConn:Disconnect()
+			hideGui.worldConn = nil
+		end
+		for g, wasEnabled in pairs(hideGui.world) do
+			if g.Parent then
+				g.Enabled = wasEnabled
+			end
+		end
+		table.clear(hideGui.world)
+		if hideGui.core then
+			for coreType, state in pairs(hideGui.core) do
+				pcall(StarterGui.SetCoreGuiEnabled, StarterGui, coreType, state)
+			end
+			hideGui.core = nil
+		end
+	end
+end
+
+---------------------------------------------------------------------
+-- UI HELPERS (style dari StarterGui.Inventory)
+---------------------------------------------------------------------
+local rgb = Color3.fromRGB
+local WHITE = Color3.new(1, 1, 1)
+local BLACK = Color3.new(0, 0, 0)
+local FONT = Enum.Font.MontserratBold
+local FONT_REGULAR = Enum.Font.Montserrat
+
+---------------------------------------------------------------------
+-- PALET TEMA
+-- Gradient tema diambil dari Workspace["SALON MUSIC BY OCTA"].TEAMS.
+-- Semua warna UI diturunkan dari gradient itu, jadi bisa diganti kapan saja.
+---------------------------------------------------------------------
+local DEFAULT_THEME = "Merah"
+local function teamGradient(c0: Color3, c1: Color3, c2: Color3): ColorSequence
+	return ColorSequence.new({
+		ColorSequenceKeypoint.new(0, c0),
+		ColorSequenceKeypoint.new(0.38, c1),
+		ColorSequenceKeypoint.new(1, c2),
+	})
+end
+-- Cadangan kalau folder TEAMS tidak ketemu (isi sama dengan folder TEAMS)
+local TEAM_FALLBACK = {
+	{ name = "Merah", color = teamGradient(rgb(255, 0, 0), rgb(255, 53, 26), rgb(185, 0, 0)) },
+	{ name = "Kuning", color = teamGradient(rgb(255, 220, 78), rgb(255, 220, 78), rgb(255, 155, 67)) },
+	{ name = "Biru", color = teamGradient(rgb(0, 255, 247), rgb(26, 244, 255), rgb(51, 185, 156)) },
+	{ name = "Hijau", color = teamGradient(rgb(0, 221, 0), rgb(64, 185, 50), rgb(39, 104, 32)) },
+	{ name = "Merahmudah", color = teamGradient(rgb(255, 116, 218), rgb(226, 118, 203), rgb(182, 106, 169)) },
+	{ name = "Birugelap", color = teamGradient(rgb(0, 13, 194), rgb(0, 4, 255), rgb(11, 17, 120)) },
+	{ name = "Ungu", color = teamGradient(rgb(145, 35, 255), rgb(153, 28, 255), rgb(105, 58, 185)) },
+}
+
+local function lum(c: Color3): number
+	return 0.299 * c.R + 0.587 * c.G + 0.114 * c.B
+end
+local function scale(c: Color3, k: number): Color3
+	return Color3.new(math.clamp(c.R * k, 0, 1), math.clamp(c.G * k, 0, 1), math.clamp(c.B * k, 0, 1))
+end
+local NEAR_BLACK = rgb(10, 8, 9)
+local function dark(base: Color3, k: number): Color3
+	return NEAR_BLACK:Lerp(base, k)
+end
+local function colorKey(c: Color3): string
+	return string.format("%d,%d,%d", math.round(c.R * 255), math.round(c.G * 255), math.round(c.B * 255))
+end
+local function seqKey(s: ColorSequence): string
+	local parts = {}
+	for _, k in ipairs(s.Keypoints) do
+		table.insert(parts, string.format("%.3f:%s", k.Time, colorKey(k.Value)))
+	end
+	return table.concat(parts, "|")
+end
+
+local PALETTE_KEYS = {
+	"Bg", "Card", "Bar", "Input", "Section", "Line", "Hover", "Stroke", "Border", "Accent", "Placeholder",
+	"Muted", "Text", "OffText", "TabText", "OnPrimary", "Selected", "Dark", "CloseHover", "SelBox", "HoverBox",
+}
+local function makePalette(seq: ColorSequence)
+	local kp = seq.Keypoints
+	local c0, c2 = kp[1].Value, kp[#kp].Value
+	local c1 = kp[math.min(2, #kp)].Value
+	local base = c0:Lerp(c2, 0.5)
+	local bright = lum(c1) > 0.6 -- gradient terang (kuning, cyan) pakai teks gelap
+	local p = {
+		Bg = dark(base, 0.09),
+		Card = dark(base, 0.05),
+		Bar = dark(base, 0.13),
+		Input = dark(base, 0.16),
+		Section = dark(base, 0.19),
+		Line = dark(base, 0.21),
+		Hover = dark(base, 0.29),
+		Stroke = scale(c2, 0.8),
+		Border = scale(c2, 0.8),
+		Accent = c1:Lerp(WHITE, 0.25),
+		Placeholder = bright and scale(c2, 0.45) or c0:Lerp(WHITE, 0.75),
+		Muted = scale(base, 0.75):Lerp(WHITE, 0.55),
+		Text = base:Lerp(WHITE, 0.92),
+		OffText = base:Lerp(WHITE, 0.65),
+		TabText = scale(c2, 0.12),
+		OnPrimary = bright and scale(c2, 0.2) or rgb(255, 254, 254),
+		Selected = scale(c2, 0.75),
+		Dark = c2,
+		CloseHover = scale(c2, 0.6),
+		SelBox = c0:Lerp(WHITE, 0.15),
+		HoverBox = c0:Lerp(WHITE, 0.5),
+	}
+	-- tiap warna dibuat unik (beda 1-2 angka, tidak kelihatan) supaya bisa dipetakan saat ganti tema
+	local used = { ["255,255,255"] = true, ["0,0,0"] = true, ["225,225,225"] = true, ["255,95,95"] = true, ["120,0,0"] = true }
+	for _, key in ipairs(PALETTE_KEYS) do
+		local c = p[key]
+		local r, g, b = math.round(c.R * 255), math.round(c.G * 255), math.round(c.B * 255)
+		local dir = b < 128 and 1 or -1
+		local tries = 0
+		while used[string.format("%d,%d,%d", r, g, b)] and tries < 60 do
+			b += dir
+			tries += 1
+		end
+		p[key] = Color3.fromRGB(r, g, b)
+		used[string.format("%d,%d,%d", r, g, b)] = true
+	end
+	p.Primary = seq
+	p.Danger = teamGradient(scale(c0, 0.6), scale(c1, 0.5), scale(c2, 0.45))
+	p.Off = teamGradient(dark(base, 0.3), dark(base, 0.26), dark(base, 0.18))
+	p.Error = rgb(255, 95, 95)
+	return p
+end
+
+-- P = palet aktif (tabel ini diubah isinya saat ganti tema, jangan diganti tabelnya)
+local P = makePalette(TEAM_FALLBACK[1].color)
+
+-- Tema tombol: color = gradient, text = warna teks, transparent = tanpa background
+local PRIMARY = { color = P.Primary, text = P.OnPrimary }
+local THEMES = {
+	Green = PRIMARY,
+	Teal = PRIMARY,
+	Purple = PRIMARY,
+	Yellow = PRIMARY,
+	Red = { color = P.Danger, text = WHITE },
+	Off = { color = P.Off, text = P.OffText },
+	Tab = { color = P.Primary, text = P.TabText },
+	TabOff = { color = P.Primary, text = P.Accent, transparent = true },
+}
+local function syncThemes()
+	PRIMARY.color, PRIMARY.text = P.Primary, P.OnPrimary
+	THEMES.Red.color = P.Danger
+	THEMES.Off.color, THEMES.Off.text = P.Off, P.OffText
+	THEMES.Tab.color, THEMES.Tab.text = P.Primary, P.TabText
+	THEMES.TabOff.color, THEMES.TabOff.text = P.Primary, P.Accent
+end
+
+local themeRoots = {} -- ScreenGui yang ikut diwarnai ulang
+local themeSkip = {} -- bagian yang tidak boleh diwarnai ulang (contoh: kotak pilihan tema)
+local themeListeners = {} -- dipanggil setelah tema berubah
+local THEMED_PROPS = { "BackgroundColor3", "TextColor3", "PlaceholderColor3", "ImageColor3", "ScrollBarImageColor3", "Color3" }
+
+local function isSkipped(inst: Instance): boolean
+	for _, skip in ipairs(themeSkip) do
+		if inst == skip or inst:IsDescendantOf(skip) then
+			return true
+		end
+	end
+	return false
+end
+
+-- Ganti tema: warna lama di semua GUI dipetakan ke warna baru dengan nama yang sama
+local function applyPalette(newP)
+	local colorMap, seqMap = {}, {}
+	for key, old in pairs(P) do
+		local value = newP[key]
+		if typeof(old) == "Color3" then
+			colorMap[colorKey(old)] = value
+		elseif typeof(old) == "ColorSequence" then
+			seqMap[seqKey(old)] = value
+		end
+	end
+	for _, root in ipairs(themeRoots) do
+		for _, inst in ipairs(root:GetDescendants()) do
+			if not isSkipped(inst) then
+				if inst:IsA("UIGradient") then
+					local mapped = seqMap[seqKey(inst.Color)]
+					if mapped then
+						inst.Color = mapped
+					end
+				elseif inst:IsA("UIStroke") then
+					local mapped = colorMap[colorKey(inst.Color)]
+					if mapped then
+						inst.Color = mapped
+					end
+				else
+					for _, prop in ipairs(THEMED_PROPS) do
+						local ok, value = pcall(function()
+							return (inst :: any)[prop]
+						end)
+						if ok and typeof(value) == "Color3" then
+							local mapped = colorMap[colorKey(value)]
+							if mapped then
+								(inst :: any)[prop] = mapped
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	for key, value in pairs(newP) do
+		P[key] = value
+	end
+	syncThemes()
+	for _, listener in ipairs(themeListeners) do
+		task.spawn(listener)
+	end
+end
+
+local function new(className: string, props: { [string]: any }): any
+	local inst = Instance.new(className)
+	for key, value in pairs(props) do
+		if key ~= "Parent" then
+			inst[key] = value
+		end
+	end
+	inst.Parent = props.Parent
+	return inst
+end
+
+local function corner(parent: Instance, radius: number)
+	return new("UICorner", { CornerRadius = UDim.new(0, radius), Parent = parent })
+end
+
+local function stroke(parent: Instance, color: Color3, thickness: number, mode: Enum.ApplyStrokeMode?, transparency: number?, join: Enum.LineJoinMode?)
+	return new("UIStroke", {
+		Color = color,
+		Thickness = thickness,
+		ApplyStrokeMode = mode or Enum.ApplyStrokeMode.Border,
+		Transparency = transparency or 0,
+		LineJoinMode = join or Enum.LineJoinMode.Round,
+		Parent = parent,
+	})
+end
+
+local function gradient(parent: Instance, top: Color3, bottom: Color3)
+	return new("UIGradient", { Color = ColorSequence.new(top, bottom), Rotation = 90, Parent = parent })
+end
+
+-- Background putih + gradient tema (warna asli datang dari gradient)
+local function redGradient(parent: Instance): UIGradient
+	return new("UIGradient", { Color = P.Primary, Rotation = 90, Parent = parent })
+end
+
+local function setTheme(refs, theme)
+	refs.theme = theme
+	refs.gradient.Color = theme.color
+	refs.button.BackgroundTransparency = theme.transparent and 1 or 0
+	refs.label.TextColor3 = theme.text
+end
+
+-- Tombol gradient: rounded, teks tebal, tanpa studs (gaya panel musik)
+local function glossyButton(parent: Instance, size: UDim2, theme, text: string, textSize: number, extra: { [string]: any }?)
+	local props = {
+		Size = size,
+		BackgroundColor3 = WHITE,
+		Text = "",
+		AutoButtonColor = false,
+		Parent = parent,
+	}
+	if extra then
+		for key, value in pairs(extra) do
+			props[key] = value
+		end
+	end
+
+	local refs = {}
+	refs.button = new("TextButton", props)
+	corner(refs.button, 8)
+	refs.gradient = new("UIGradient", { Rotation = 90, Parent = refs.button })
+	refs.label = new("TextLabel", {
+		Name = "Label",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Text = text,
+		Font = FONT,
+		TextSize = textSize,
+		TextColor3 = WHITE,
+		ZIndex = 2,
+		Parent = refs.button,
+	})
+	refs.button.MouseEnter:Connect(function()
+		refs.button.BackgroundColor3 = rgb(225, 225, 225)
+	end)
+	refs.button.MouseLeave:Connect(function()
+		refs.button.BackgroundColor3 = WHITE
+	end)
+	setTheme(refs, theme)
+	return refs
+end
+
+---------------------------------------------------------------------
+-- UI STATE
+---------------------------------------------------------------------
+local toggleRefs = {}
+local hintLabel
+local statusActive = false
+local HINT_DEFAULT = "RightShift = hide/show panel"
+
+local function currentHint(): string
+	if enabled.Freecam then
+		return "Freecam: tahan klik kanan = lihat | scroll = zoom | WASD + E/Q naik/turun | Shift = cepat"
+	elseif enabled.Fly then
+		return "Fly: arahkan kamera untuk naik / turun / belok, tahan W untuk maju"
+	elseif enabled.Swim then
+		return "Swim: arahkan kamera untuk naik / turun / belok, tahan W untuk maju"
+	end
+	return HINT_DEFAULT
+end
+
+local function refreshUI()
+	for name, refs in pairs(toggleRefs) do
+		local on = enabled[name]
+		refs.label.Text = on and "ON" or "OFF"
+		setTheme(refs, on and THEMES.Green or THEMES.Off)
+	end
+	if hintLabel and not statusActive then
+		hintLabel.Text = currentHint()
+	end
+end
+
+local function setEnabled(name: string, on: boolean)
+	if enabled[name] == on then
+		return
+	end
+	-- Fly dan Swim saling eksklusif
+	if on then
+		if name == "Fly" and enabled.Swim then
+			enabled.Swim = false
+			features.Swim(false)
+		elseif name == "Swim" and enabled.Fly then
+			enabled.Fly = false
+			features.Fly(false)
+		end
+	end
+	enabled[name] = on
+	features[name](on)
+	refreshUI()
+end
+
+---------------------------------------------------------------------
+-- LOOPS
+---------------------------------------------------------------------
+-- Noclip: harus sebelum physics step
+RunService.Stepped:Connect(function()
+	if not enabled.Noclip or not character then
+		return
+	end
+	for _, part in ipairs(character:GetDescendants()) do
+		if part:IsA("BasePart") and part.CanCollide then
+			noclipCache[part] = true
+			part.CanCollide = false
+		end
+	end
+end)
+
+-- Fly / Swim: velocity + orientasi avatar mengikuti kamera
+local function updateMover()
+	if not (mover and mover.velocity.Parent and rootPart) then
+		return
+	end
+	local dir = getInputDirection()
+	local speed = enabled.Fly and values.FlySpeed or values.SwimSpeed
+	mover.velocity.VectorVelocity = dir * speed
+
+	if mover.align and mover.align.Parent and not enabled.Freecam then
+		local cam = workspace.CurrentCamera
+		if not cam then
+			return
+		end
+		local camCF = cam.CFrame
+		if FLY_TILT_WITH_CAMERA and dir.Magnitude > 0.1 then
+			-- badan sejajar arah kamera: lihat atas = tegak, lihat lurus ke depan = rebah (perut ke bawah), lihat bawah = menukik
+			mover.align.CFrame = camCF.Rotation * CFrame.Angles(-math.pi / 2, 0, 0)
+		else
+			local look = camCF.LookVector
+			local flat = Vector3.new(look.X, 0, look.Z)
+			if flat.Magnitude > 0.001 then
+				mover.align.CFrame = CFrame.lookAt(Vector3.zero, flat.Unit)
+			end
+		end
+	end
+end
+
+-- Freecam: rotasi + gerak + zoom, semuanya dengan inertia (meluncur halus saat input berhenti)
+local function updateFreecam(dt: number)
+	if not freecam.active then
+		return
+	end
+	local cam = workspace.CurrentCamera
+	if not cam then
+		return
+	end
+	if cam.CameraType ~= Enum.CameraType.Scriptable then
+		cam.CameraType = Enum.CameraType.Scriptable
+	end
+
+	-- rotasi: kecepatan sudut meluruh pelan-pelan setelah mouse berhenti
+	freecam.yaw += freecam.yawVel * dt
+	local maxPitch = math.rad(89)
+	local newPitch = freecam.pitch + freecam.pitchVel * dt
+	if math.abs(newPitch) >= maxPitch then
+		newPitch = math.clamp(newPitch, -maxPitch, maxPitch)
+		freecam.pitchVel = 0
+	end
+	freecam.pitch = newPitch
+	local damp = math.exp(-FREECAM.LookDamping * dt)
+	freecam.yawVel *= damp
+	freecam.pitchVel *= damp
+	local rot = CFrame.fromOrientation(freecam.pitch, freecam.yaw, 0)
+
+	-- gerak
+	local mv = getMoveVector()
+	local wish = rot:VectorToWorldSpace(Vector3.new(mv.X, 0, mv.Z))
+	if not UserInputService:GetFocusedTextBox() then
+		local vertical = 0
+		if anyKeyDown(FREECAM.UpKeys) then
+			vertical += 1
+		end
+		if anyKeyDown(FREECAM.DownKeys) then
+			vertical -= 1
+		end
+		wish += Vector3.new(0, vertical, 0)
+	end
+	if wish.Magnitude > 1 then
+		wish = wish.Unit
+	end
+	local speed = values.FreecamSpeed
+	if UserInputService:IsKeyDown(FREECAM.FastKey) then
+		speed *= FREECAM.FastMultiplier
+	end
+	freecam.vel = freecam.vel:Lerp(wish * speed, 1 - math.exp(-FREECAM.MoveSmooth * dt))
+	freecam.pos += freecam.vel * dt
+
+	-- zoom (FOV) halus
+	freecam.fov += (freecam.targetFov - freecam.fov) * (1 - math.exp(-FREECAM.ZoomSmooth * dt))
+	cam.FieldOfView = freecam.fov
+	cam.CFrame = CFrame.new(freecam.pos) * rot
+end
+
+RunService.RenderStepped:Connect(function(dt)
+	updateMover()
+	updateFreecam(dt)
+end)
+
+-- Speed / Jump / Swim state dijaga supaya tidak ditimpa script game
+RunService.Heartbeat:Connect(function()
+	if not humanoid or humanoid.Health <= 0 then
+		return
+	end
+	if enabled.Speed and humanoid.WalkSpeed ~= values.WalkSpeed then
+		humanoid.WalkSpeed = values.WalkSpeed
+	end
+	if enabled.Jump then
+		if not humanoid.UseJumpPower then
+			humanoid.UseJumpPower = true
+		end
+		if humanoid.JumpPower ~= values.JumpPower then
+			humanoid.JumpPower = values.JumpPower
+		end
+	end
+	if enabled.Swim and humanoid:GetState() ~= Enum.HumanoidStateType.Swimming then
+		humanoid:ChangeState(Enum.HumanoidStateType.Swimming)
+	end
+end)
+
+-- Input freecam: klik kanan tahan = lihat, scroll = zoom, touch drag = lihat, pinch = zoom
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if freecam.active and not gameProcessed and input.UserInputType == Enum.UserInputType.MouseButton2 then
+		freecam.rmb = true
+		UserInputService.MouseBehavior = Enum.MouseBehavior.LockCurrentPosition
+	end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton2 and freecam.rmb then
+		freecam.rmb = false
+		UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input, gameProcessed)
+	if not freecam.active then
+		return
+	end
+	if input.UserInputType == Enum.UserInputType.MouseMovement then
+		if freecam.rmb then
+			addLookImpulse(input.Delta.X, input.Delta.Y)
+		end
+	elseif input.UserInputType == Enum.UserInputType.MouseWheel then
+		if not gameProcessed then
+			freecam.targetFov = math.clamp(
+				freecam.targetFov * FREECAM.ZoomStep ^ input.Position.Z,
+				FREECAM.FovMin, FREECAM.FovMax
+			)
+		end
+	elseif input.UserInputType == Enum.UserInputType.Touch then
+		if not gameProcessed then
+			addLookImpulse(input.Delta.X, input.Delta.Y)
+		end
+	end
+end)
+
+UserInputService.TouchPinch:Connect(function(_, scale, _, state, gameProcessed)
+	if not freecam.active or gameProcessed then
+		return
+	end
+	if state == Enum.UserInputState.Begin then
+		freecam.pinchBase = freecam.targetFov
+	elseif state == Enum.UserInputState.Change then
+		freecam.targetFov = math.clamp(freecam.pinchBase / math.max(scale, 0.01), FREECAM.FovMin, FREECAM.FovMax)
+	end
+end)
+
+---------------------------------------------------------------------
+-- CHARACTER LIFECYCLE
+---------------------------------------------------------------------
+local function onCharacterAdded(char: Model)
+	local hum = char:WaitForChild("Humanoid") :: Humanoid
+	local root = char:WaitForChild("HumanoidRootPart") :: BasePart
+	if player.Character ~= char then
+		return
+	end
+
+	character, humanoid, rootPart = char, hum, root
+	mover = nil
+	table.clear(noclipCache)
+
+	original.WalkSpeed = hum.WalkSpeed
+	original.JumpPower = hum.JumpPower
+	original.UseJumpPower = hum.UseJumpPower
+
+	-- pasang ulang fitur yang masih ON setelah respawn (Hide GUI tidak bergantung karakter)
+	for name, on in pairs(enabled) do
+		if on and name ~= "HideGui" then
+			features[name](true)
+		end
+	end
+end
+
+player.CharacterRemoving:Connect(function()
+	destroyMover()
+	table.clear(noclipCache)
+	freecam.frozenRoot = nil
+	character, humanoid, rootPart = nil, nil, nil
+end)
+player.CharacterAdded:Connect(onCharacterAdded)
+
+---------------------------------------------------------------------
+-- UI BUILD
+---------------------------------------------------------------------
+local ROW_HEIGHT, ROW_GAP, FEATURE_ROWS = 36, 6, 8
+local FEATURES_HEIGHT = FEATURE_ROWS * ROW_HEIGHT + (FEATURE_ROWS - 1) * ROW_GAP + 16
+local LIST_HEIGHT = 84
+local CONTENT_GAP = 8
+local CONTENT_HEIGHT = FEATURES_HEIGHT + 24 + 40 + LIST_HEIGHT + 30 + CONTENT_GAP * 4
+local PAGE_TOP = 100 -- di bawah header (58) + baris tab (34) + jarak
+local PANEL_HEIGHT = PAGE_TOP + CONTENT_HEIGHT + 10
+
+local old = playerGui:FindFirstChild("PlayerUtilityPanel")
+if old then
+	old:Destroy()
+end
+
+local gui = new("ScreenGui", {
+	Name = "PlayerUtilityPanel",
+	ResetOnSpawn = false,
+	DisplayOrder = 100,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	Parent = playerGui,
+})
+-- Cutscene game yang mematikan semua ScreenGui tidak ikut menyembunyikan panel ini
+-- (panel tetap bisa disembunyikan lewat tombol X / RightShift milik panel sendiri).
+gui:GetPropertyChangedSignal("Enabled"):Connect(function()
+	if not gui.Enabled then
+		gui.Enabled = true
+	end
+end)
+
+-- Panel utama (BG 18,28,48 / stroke hitam 3 / corner 10 seperti Inventory)
+local main = new("Frame", {
+	Name = "Panel",
+	Size = UDim2.fromOffset(340, PANEL_HEIGHT),
+	AnchorPoint = Vector2.new(0, 0.5),
+	Position = UDim2.new(0, 20, 0.5, 0),
+	BackgroundColor3 = P.Bg,
+	BackgroundTransparency = 0,
+	Parent = gui,
+})
+corner(main, 14)
+stroke(main, P.Stroke, 2)
+
+-- Panel mengecil otomatis kalau layar pendek
+local uiScale = new("UIScale", { Parent = main })
+local function updateScale()
+	local cam = workspace.CurrentCamera
+	if cam then
+		uiScale.Scale = math.clamp((cam.ViewportSize.Y - 40) / PANEL_HEIGHT, 0.5, 1)
+	end
+end
+updateScale()
+if workspace.CurrentCamera then
+	workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(updateScale)
+end
+
+-- Top bar (draggable): icon + judul
+local top = new("Frame", {
+	Name = "Top",
+	AnchorPoint = Vector2.new(0.5, 0),
+	Position = UDim2.new(0.5, 0, 0, 0),
+	Size = UDim2.new(1, 0, 0, 50),
+	BackgroundTransparency = 1,
+	ZIndex = 3,
+	Parent = main,
+})
+new("UIListLayout", {
+	FillDirection = Enum.FillDirection.Horizontal,
+	VerticalAlignment = Enum.VerticalAlignment.Center,
+	Padding = UDim.new(0, 10),
+	SortOrder = Enum.SortOrder.LayoutOrder,
+	Parent = top,
+})
+new("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10), Parent = top })
+new("ImageLabel", {
+	Name = "Icon",
+	Size = UDim2.fromOffset(40, 40),
+	BackgroundTransparency = 1,
+	Image = ASSETS.Icon,
+	Visible = false,
+	ZIndex = 3,
+	LayoutOrder = 1,
+	Parent = top,
+})
+local title = new("TextLabel", {
+	Name = "Title",
+	Text = "Player Utility",
+	Size = UDim2.new(1, -110, 1, 0),
+	BackgroundTransparency = 1,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	Font = FONT,
+	TextSize = 22,
+	TextColor3 = WHITE,
+	ZIndex = 3,
+	LayoutOrder = 2,
+	Parent = top,
+})
+
+-- Tombol close (gradient merah)
+local closeButton = new("TextButton", {
+	Name = "Close",
+	AnchorPoint = Vector2.new(1, 0.5),
+	Position = UDim2.new(1, -10, 0, 27),
+	Size = UDim2.fromOffset(32, 32),
+	BackgroundColor3 = WHITE,
+	Text = "",
+	AutoButtonColor = false,
+	ZIndex = 6,
+	Parent = main,
+})
+corner(closeButton, 8)
+redGradient(closeButton)
+-- teks di label terpisah supaya tidak ikut diwarnai gradient
+new("TextLabel", {
+	Size = UDim2.fromScale(1, 1),
+	BackgroundTransparency = 1,
+	Text = "X",
+	Font = Enum.Font.GothamBold,
+	TextSize = 16,
+	TextColor3 = P.OnPrimary,
+	ZIndex = 7,
+	Parent = closeButton,
+})
+
+-- Konten
+local content = new("Frame", {
+	Name = "Content",
+	Position = UDim2.fromOffset(8, PAGE_TOP),
+	Size = UDim2.new(1, -16, 0, CONTENT_HEIGHT),
+	BackgroundTransparency = 1,
+	ZIndex = 2,
+	Parent = main,
+})
+new("UIListLayout", {
+	Padding = UDim.new(0, CONTENT_GAP),
+	SortOrder = Enum.SortOrder.LayoutOrder,
+	Parent = content,
+})
+
+-- Container fitur (BG 8,14,28 transparan seperti Equipped/List)
+local featuresFrame = new("Frame", {
+	Name = "Features",
+	Size = UDim2.new(1, 0, 0, FEATURES_HEIGHT),
+	BackgroundColor3 = P.Card,
+	BackgroundTransparency = 0,
+	LayoutOrder = 1,
+	Parent = content,
+})
+corner(featuresFrame, 10)
+new("UIPadding", {
+	PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8),
+	PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8),
+	Parent = featuresFrame,
+})
+new("UIListLayout", {
+	Padding = UDim.new(0, ROW_GAP),
+	SortOrder = Enum.SortOrder.LayoutOrder,
+	Parent = featuresFrame,
+})
+
+-- Hint / status
+hintLabel = new("TextLabel", {
+	Name = "Hint",
+	Text = HINT_DEFAULT,
+	Size = UDim2.new(1, 0, 0, 30),
+	BackgroundTransparency = 1,
+	TextWrapped = true,
+	Font = FONT,
+	TextSize = 12,
+	TextColor3 = P.Muted,
+	LayoutOrder = 5,
+	Parent = content,
+})
+local statusToken = 0
+local function setStatus(text: string)
+	statusToken += 1
+	local token = statusToken
+	statusActive = true
+	hintLabel.Text = text
+	task.delay(3, function()
+		if token == statusToken then
+			statusActive = false
+			hintLabel.Text = currentHint()
+		end
+	end)
+end
+
+-- Baris fitur: label + (opsional) input angka + tombol toggle glossy
+local function buildFeatureRow(order: number, featureName: string, label: string, valueKey: string?)
+	local row = new("Frame", {
+		Size = UDim2.new(1, 0, 0, ROW_HEIGHT),
+		BackgroundTransparency = 1,
+		LayoutOrder = order,
+		Parent = featuresFrame,
+	})
+
+	local text = new("TextLabel", {
+		Text = label,
+		Size = UDim2.new(0, 120, 1, 0),
+		BackgroundTransparency = 1,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Font = FONT_REGULAR,
+		TextSize = 15,
+		TextColor3 = WHITE,
+		Parent = row,
+	})
+
+	local refs = glossyButton(row, UDim2.fromOffset(72, 30), THEMES.Off, "OFF", 15, {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, 0, 0.5, 0),
+	})
+	toggleRefs[featureName] = refs
+	refs.button.Activated:Connect(function()
+		setEnabled(featureName, not enabled[featureName])
+	end)
+
+	if valueKey then
+		local boxFrame = new("Frame", {
+			Size = UDim2.fromOffset(60, 28),
+			AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, -80, 0.5, 0),
+			BackgroundColor3 = WHITE,
+			Parent = row,
+		})
+		corner(boxFrame, 8)
+		redGradient(boxFrame)
+		local box = new("TextBox", {
+			Text = tostring(values[valueKey]),
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+			ClearTextOnFocus = false,
+			Font = FONT,
+			TextSize = 16,
+			TextColor3 = P.OnPrimary,
+			Parent = boxFrame,
+		})
+		box.FocusLost:Connect(function()
+			local n = tonumber(box.Text)
+			if n then
+				values[valueKey] = math.clamp(n, VALUE_MIN, VALUE_MAX)
+			end
+			box.Text = tostring(values[valueKey])
+		end)
+	end
+end
+
+buildFeatureRow(1, "Fly", "Fly", "FlySpeed")
+buildFeatureRow(2, "Swim", "Swim", "SwimSpeed")
+buildFeatureRow(3, "Speed", "Speed", "WalkSpeed")
+buildFeatureRow(4, "Jump", "Super Jump", "JumpPower")
+buildFeatureRow(5, "Noclip", "Noclip", nil)
+buildFeatureRow(6, "Freecam", "Freecam", "FreecamSpeed")
+buildFeatureRow(7, "HideGui", "Hide GUI", nil)
+buildFeatureRow(8, "Cursor", "Cursor", nil)
+
+-- Teleport section
+local teleportTitle = new("TextLabel", {
+	Text = "  Teleport to Player",
+	TextXAlignment = Enum.TextXAlignment.Left,
+	Size = UDim2.new(1, 0, 0, 24),
+	BackgroundTransparency = 1,
+	Font = FONT,
+	TextSize = 20,
+	TextColor3 = WHITE,
+	LayoutOrder = 2,
+	Parent = content,
+})
+
+-- Search box (putih gradient + icon search seperti Inventory)
+local searchFrame = new("Frame", {
+	Name = "Search",
+	Size = UDim2.new(1, 0, 0, 40),
+	BackgroundColor3 = WHITE,
+	LayoutOrder = 3,
+	Parent = content,
+})
+corner(searchFrame, 8)
+redGradient(searchFrame)
+new("ImageLabel", {
+	Name = "Icon",
+	AnchorPoint = Vector2.new(0, 0.5),
+	Position = UDim2.new(0, 10, 0.5, 0),
+	Size = UDim2.fromOffset(24, 24),
+	BackgroundTransparency = 1,
+	Image = ASSETS.Search,
+	ImageColor3 = P.OnPrimary,
+	ScaleType = Enum.ScaleType.Fit,
+	Parent = searchFrame,
+})
+local searchBox = new("TextBox", {
+	Name = "Box",
+	Position = UDim2.fromOffset(42, 0),
+	Size = UDim2.new(1, -50, 1, 0),
+	BackgroundTransparency = 1,
+	Text = "",
+	PlaceholderText = "Cari player...",
+	PlaceholderColor3 = P.Placeholder,
+	ClearTextOnFocus = false,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	Font = FONT,
+	TextSize = 18,
+	TextColor3 = P.OnPrimary,
+	Parent = searchFrame,
+})
+
+-- List player (scrolling, BG sama seperti List Inventory)
+local listFrame = new("ScrollingFrame", {
+	Name = "PlayerList",
+	Size = UDim2.new(1, 0, 0, LIST_HEIGHT),
+	BackgroundColor3 = P.Card,
+	BackgroundTransparency = 0,
+	BorderSizePixel = 0,
+	CanvasSize = UDim2.new(),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	ScrollBarThickness = 5,
+	ScrollBarImageColor3 = P.Accent,
+	LayoutOrder = 4,
+	Parent = content,
+})
+corner(listFrame, 10)
+new("UIListLayout", {
+	Padding = UDim.new(0, 8),
+	SortOrder = Enum.SortOrder.LayoutOrder,
+	Parent = listFrame,
+})
+new("UIPadding", {
+	PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8),
+	PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 12),
+	Parent = listFrame,
+})
+
+local function teleportToPlayer(target: Player)
+	local targetChar = target.Character
+	local targetRoot = targetChar and targetChar:FindFirstChild("HumanoidRootPart")
+	if not targetRoot then
+		setStatus(target.DisplayName .. " belum punya karakter.")
+		return
+	end
+	if not (character and rootPart) then
+		setStatus("Karakter kamu belum siap.")
+		return
+	end
+	if enabled.Freecam then
+		setStatus("Matikan Freecam dulu untuk teleport.")
+		return
+	end
+	character:PivotTo(targetRoot.CFrame * TELEPORT_OFFSET)
+	rootPart.AssemblyLinearVelocity = Vector3.zero
+	setStatus("Teleport ke " .. target.DisplayName)
+end
+
+-- Kartu player: gradient merah + foto avatar + nama (gaya item playlist)
+local CARD_COLOR = WHITE
+local CARD_HOVER = rgb(225, 225, 225)
+
+local function buildPlayerCard(plr: Player, order: number)
+	local card = new("TextButton", {
+		Name = plr.Name,
+		Size = UDim2.new(1, 0, 0, 42),
+		BackgroundColor3 = CARD_COLOR,
+		Text = "",
+		AutoButtonColor = false,
+		LayoutOrder = order,
+		Parent = listFrame,
+	})
+	corner(card, 8)
+	redGradient(card)
+	local avatar = new("ImageLabel", {
+		Name = "Avatar",
+		Position = UDim2.fromOffset(5, 5),
+		Size = UDim2.fromOffset(32, 32),
+		BackgroundColor3 = P.Input,
+		Image = "rbxthumb://type=AvatarHeadShot&id=" .. plr.UserId .. "&w=48&h=48",
+		Parent = card,
+	})
+	corner(avatar, 6)
+	new("TextLabel", {
+		Name = "PlayerName",
+		Text = plr.DisplayName,
+		Position = UDim2.fromOffset(44, 4),
+		Size = UDim2.new(1, -52, 0, 19),
+		BackgroundTransparency = 1,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Font = FONT,
+		TextSize = 15,
+		TextColor3 = P.OnPrimary,
+		Parent = card,
+	})
+	new("TextLabel", {
+		Name = "Username",
+		Text = "@" .. plr.Name,
+		Position = UDim2.fromOffset(44, 22),
+		Size = UDim2.new(1, -52, 0, 15),
+		BackgroundTransparency = 1,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Font = FONT_REGULAR,
+		TextSize = 12,
+		TextColor3 = P.Placeholder,
+		Parent = card,
+	})
+
+	card.MouseEnter:Connect(function() card.BackgroundColor3 = CARD_HOVER end)
+	card.MouseLeave:Connect(function() card.BackgroundColor3 = CARD_COLOR end)
+	card.Activated:Connect(function()
+		teleportToPlayer(plr)
+	end)
+end
+
+local function refreshPlayerList()
+	for _, child in ipairs(listFrame:GetChildren()) do
+		if child:IsA("TextButton") or child:IsA("TextLabel") then
+			child:Destroy()
+		end
+	end
+
+	local filter = string.lower(searchBox.Text)
+	local list = Players:GetPlayers()
+	table.sort(list, function(a, b)
+		return string.lower(a.DisplayName) < string.lower(b.DisplayName)
+	end)
+
+	local count = 0
+	for _, plr in ipairs(list) do
+		if plr ~= player then
+			local text = string.format("%s (@%s)", plr.DisplayName, plr.Name)
+			if filter == "" or string.find(string.lower(text), filter, 1, true) then
+				count += 1
+				buildPlayerCard(plr, count)
+			end
+		end
+	end
+
+	if count == 0 then
+		new("TextLabel", {
+			Text = "Tidak ada player lain",
+			Size = UDim2.new(1, 0, 0, 38),
+			BackgroundTransparency = 1,
+			Font = FONT,
+			TextSize = 16,
+			TextColor3 = P.Muted,
+			Parent = listFrame,
+		})
+	end
+end
+
+Players.PlayerAdded:Connect(function()
+	task.defer(refreshPlayerList)
+end)
+Players.PlayerRemoving:Connect(function()
+	task.defer(refreshPlayerList)
+end)
+searchBox:GetPropertyChangedSignal("Text"):Connect(refreshPlayerList)
+refreshPlayerList()
+
+
+---------------------------------------------------------------------
+-- HALAMAN TEMA (pilihan warna dari Workspace["SALON MUSIC BY OCTA"].TEAMS)
+---------------------------------------------------------------------
+local themePage = new("Frame", {
+	Name = "ThemePage",
+	Position = UDim2.fromOffset(8, PAGE_TOP),
+	Size = UDim2.new(1, -16, 0, CONTENT_HEIGHT),
+	BackgroundTransparency = 1,
+	Visible = false,
+	ZIndex = 2,
+	Parent = main,
+})
+new("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder, Parent = themePage })
+
+local themeCard = new("Frame", {
+	Name = "ThemeCard",
+	Size = UDim2.new(1, 0, 0, 0),
+	AutomaticSize = Enum.AutomaticSize.Y,
+	BackgroundColor3 = P.Card,
+	LayoutOrder = 1,
+	Parent = themePage,
+})
+corner(themeCard, 10)
+new("UIPadding", {
+	PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 10),
+	PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8),
+	Parent = themeCard,
+})
+new("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder, Parent = themeCard })
+new("TextLabel", {
+	Text = "Tema Warna",
+	Size = UDim2.new(1, 0, 0, 24),
+	BackgroundTransparency = 1,
+	Font = FONT,
+	TextSize = 20,
+	TextColor3 = WHITE,
+	LayoutOrder = 1,
+	Parent = themeCard,
+})
+
+local themeGrid = new("Frame", {
+	Name = "Swatches",
+	Size = UDim2.new(1, 0, 0, 0),
+	AutomaticSize = Enum.AutomaticSize.Y,
+	BackgroundTransparency = 1,
+	LayoutOrder = 2,
+	Parent = themeCard,
+})
+new("UIGridLayout", {
+	CellSize = UDim2.new(0.5, -4, 0, 44),
+	CellPadding = UDim2.fromOffset(8, 8),
+	SortOrder = Enum.SortOrder.LayoutOrder,
+	Parent = themeGrid,
+})
+table.insert(themeSkip, themeGrid) -- kotak pilihan tema tetap pakai warna aslinya
+
+local currentTheme = DEFAULT_THEME
+local swatchStrokes = {}
+
+local function refreshSwatches()
+	for name, s in pairs(swatchStrokes) do
+		s.Enabled = name == currentTheme
+	end
+end
+
+-- Ambil gradient dari folder TEAMS (urutan mengikuti TEAM_FALLBACK, sisanya di belakang)
+local function loadTeamThemes()
+	local list = {}
+	local ok, folder = pcall(function()
+		local salon = workspace:WaitForChild("SALON MUSIC BY OCTA", 10)
+		return salon and salon:WaitForChild("TEAMS", 10)
+	end)
+	if ok and folder then
+		local order = {}
+		for i, t in ipairs(TEAM_FALLBACK) do
+			order[t.name] = i
+		end
+		for _, g in ipairs(folder:GetChildren()) do
+			if g:IsA("UIGradient") then
+				table.insert(list, { name = g.Name, color = g.Color })
+			end
+		end
+		table.sort(list, function(a, b)
+			local oa, ob = order[a.name] or 99, order[b.name] or 99
+			if oa ~= ob then
+				return oa < ob
+			end
+			return a.name < b.name
+		end)
+	end
+	if #list == 0 then
+		list = TEAM_FALLBACK
+	end
+	return list
+end
+
+local function buildThemeSwatches(list)
+	for i, theme in ipairs(list) do
+		local button = new("TextButton", {
+			Name = theme.name,
+			BackgroundColor3 = WHITE,
+			Text = "",
+			AutoButtonColor = false,
+			LayoutOrder = i,
+			Parent = themeGrid,
+		})
+		corner(button, 8)
+		new("UIGradient", { Color = theme.color, Rotation = 90, Parent = button })
+		local kp = theme.color.Keypoints
+		local mid = kp[math.min(2, #kp)].Value
+		new("TextLabel", {
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+			Text = theme.name,
+			Font = FONT,
+			TextSize = 15,
+			TextColor3 = lum(mid) > 0.6 and rgb(35, 25, 10) or WHITE,
+			ZIndex = 2,
+			Parent = button,
+		})
+		swatchStrokes[theme.name] = new("UIStroke", {
+			Color = WHITE,
+			Thickness = 3,
+			ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+			Enabled = false,
+			Parent = button,
+		})
+		button.Activated:Connect(function()
+			if currentTheme == theme.name then
+				return
+			end
+			currentTheme = theme.name
+			applyPalette(makePalette(theme.color))
+			refreshSwatches()
+		end)
+	end
+	refreshSwatches()
+end
+task.spawn(function()
+	buildThemeSwatches(loadTeamThemes())
+end)
+
+---------------------------------------------------------------------
+-- HALAMAN EMOTE (khusus R6) - semua jalan di client
+-- Animasi diputar lewat Animator karakter sendiri (client), terlihat juga oleh pemain lain.
+-- Tambah emote baru: tambah satu baris { name = "...", id = 123 } di EMOTES.
+---------------------------------------------------------------------
+local EMOTES = {
+	{ name = "Emote 1", id = 125525861081255 },
+	{ name = "Emote 2", id = 89305022758409 },
+	{ name = "Emote 3", id = 80941009375900 },
+	{ name = "bad ateez", id = 120208943974173 },
+	{ name = "da ko to nai", id = 74299463373250 },
+	{ name = "dwued", id = 101113184542444 },
+	{ name = "kangaroo", id = 98774435678254 },
+}
+local emote = { track = nil, index = nil, conn = nil }
+local emoteButtons = {}
+
+local emotePage = new("Frame", {
+	Name = "EmotePage",
+	Position = UDim2.fromOffset(8, PAGE_TOP),
+	Size = UDim2.new(1, -16, 0, CONTENT_HEIGHT),
+	BackgroundTransparency = 1,
+	Visible = false,
+	ZIndex = 2,
+	Parent = main,
+})
+new("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder, Parent = emotePage })
+
+local emoteStatus = new("TextLabel", {
+	Name = "EmoteStatus",
+	Text = "Emote khusus R6. Pilih emote, klik lagi untuk berhenti.",
+	Size = UDim2.new(1, 0, 0, 34),
+	BackgroundTransparency = 1,
+	Font = FONT,
+	TextSize = 13,
+	TextColor3 = WHITE,
+	TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	LayoutOrder = 1,
+	ZIndex = 2,
+	Parent = emotePage,
+})
+local emoteStopRefs = glossyButton(emotePage, UDim2.new(1, 0, 0, 36), THEMES.Red, "STOP EMOTE", 16, { LayoutOrder = 2 })
+
+local emoteList = new("ScrollingFrame", {
+	Name = "EmoteList",
+	Size = UDim2.new(1, 0, 1, -86),
+	BackgroundColor3 = P.Card,
+	BorderSizePixel = 0,
+	CanvasSize = UDim2.new(),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	ScrollBarThickness = 5,
+	ScrollBarImageColor3 = P.Accent,
+	LayoutOrder = 3,
+	Parent = emotePage,
+})
+corner(emoteList, 10)
+new("UIPadding", {
+	PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8),
+	PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8),
+	Parent = emoteList,
+})
+new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder, Parent = emoteList })
+
+local function refreshEmoteButtons()
+	for i, refs in ipairs(emoteButtons) do
+		setTheme(refs, i == emote.index and THEMES.Green or THEMES.Off)
+	end
+	setTheme(emoteStopRefs, THEMES.Red)
+end
+
+local function stopEmote(message: string?)
+	if emote.conn then
+		emote.conn:Disconnect()
+		emote.conn = nil
+	end
+	if emote.track then
+		pcall(function() emote.track:Stop(0.2) end)
+		emote.track = nil
+	end
+	emote.index = nil
+	refreshEmoteButtons()
+	if message then
+		emoteStatus.Text = message
+	end
+end
+
+local function playEmote(i: number)
+	if emote.index == i then
+		stopEmote("Emote dihentikan.")
+		return
+	end
+	stopEmote()
+	local data = EMOTES[i]
+	local char = player.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not (data and hum and hum.Health > 0) then
+		emoteStatus.Text = "Karakter belum siap."
+		return
+	end
+	if hum.RigType ~= Enum.HumanoidRigType.R6 then
+		emoteStatus.Text = "Emote ini khusus R6, karaktermu bukan R6."
+		return
+	end
+	local animator = hum:FindFirstChildOfClass("Animator")
+	if not animator then
+		animator = Instance.new("Animator")
+		animator.Parent = hum
+	end
+	local anim = Instance.new("Animation")
+	anim.AnimationId = "rbxassetid://" .. data.id
+	local ok, track = pcall(function() return animator:LoadAnimation(anim) end)
+	if not ok or not track then
+		emoteStatus.Text = "Gagal memuat emote: " .. data.name
+		return
+	end
+	track.Priority = Enum.AnimationPriority.Action4
+	track.Looped = true
+	track:Play(0.2)
+	emote.track, emote.index = track, i
+	refreshEmoteButtons()
+	emoteStatus.Text = "Memutar: " .. data.name .. " (klik lagi atau STOP untuk berhenti)"
+
+	-- animasi yang tidak bisa dimuat (asset tidak boleh dipakai di game ini) panjangnya 0
+	task.delay(1.5, function()
+		if emote.track == track and track.Length <= 0 then
+			stopEmote("Animasi tidak bisa dimuat. Cek izin asset " .. data.id .. " untuk game ini.")
+		end
+	end)
+
+	-- emote tetap jalan saat karakter bergerak / lompat; berhenti hanya kalau mati atau respawn
+	emote.conn = RunService.Heartbeat:Connect(function()
+		if emote.track ~= track then return end
+		if not hum.Parent or hum.Health <= 0 then
+			stopEmote("Emote dihentikan.")
+			return
+		end
+
+	end)
+end
+
+for i, data in ipairs(EMOTES) do
+	local refs = glossyButton(emoteList, UDim2.new(1, 0, 0, 34), THEMES.Off, data.name, 15, { LayoutOrder = i })
+	refs.button.Activated:Connect(function()
+		playEmote(i)
+	end)
+	emoteButtons[i] = refs
+end
+emoteStopRefs.button.Activated:Connect(function()
+	stopEmote("Emote dihentikan.")
+end)
+
+---------------------------------------------------------------------
+-- HALAMAN NIGHT VISION (lihat player / model di folder Workspace) - semua jalan di client
+-- Opsi: Line, Jarak, Nama, Nama Custom, Body. Target: pemain lain + model di dalam folder NV_FOLDERS.
+-- Nama Custom: kalau pemain / model pakai rig custom (bukan avatar Roblox standar), namanya jadi "Custom" merah.
+---------------------------------------------------------------------
+local NV_FOLDERS = { "Stalker", "Pembunuh", "Hidden", "Abysswalker", "Veil", "Slasher", "Masked", "Cure", "!General", "Butcher" }
+local NV_GREEN = Color3.fromRGB(60, 255, 90)
+local NV_RED = Color3.fromRGB(255, 50, 50)
+local nv = { on = false, line = true, distance = true, name = true, custom = true, body = true }
+local nvEntries = {} -- [model] = { highlight, billboard, label, line }
+local nvLastScan = 0
+
+local R6_PARTS = { "Head", "Torso", "Left Arm", "Right Arm", "Left Leg", "Right Leg", "HumanoidRootPart" }
+local R15_PARTS = { "Head", "UpperTorso", "LowerTorso", "LeftUpperArm", "RightUpperArm", "LeftUpperLeg", "RightUpperLeg", "HumanoidRootPart" }
+
+local nvFolder = Instance.new("Folder")
+nvFolder.Name = "NightVisionObjects"
+nvFolder.Parent = playerGui
+local nvGui = Instance.new("ScreenGui")
+nvGui.Name = "NightVisionLines"
+nvGui.ResetOnSpawn = false
+nvGui.IgnoreGuiInset = true
+nvGui.DisplayOrder = 5
+nvGui.Parent = playerGui
+KEEP_VISIBLE_GUIS[nvGui.Name] = true
+
+local function nvIsCustom(model: Model): boolean
+	local plr = Players:GetPlayerFromCharacter(model)
+	if not plr then
+		return true -- model dari game (NPC / rig bawaan game), bukan avatar pemain
+	end
+	local hum = model:FindFirstChildOfClass("Humanoid")
+	if not hum then
+		return true
+	end
+	local list = hum.RigType == Enum.HumanoidRigType.R15 and R15_PARTS or R6_PARTS
+	for _, partName in ipairs(list) do
+		if not model:FindFirstChild(partName) then
+			return true
+		end
+	end
+	return false
+end
+
+local function nvAnchor(model: Model): BasePart?
+	return model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function nvRemove(model)
+	local e = nvEntries[model]
+	if not e then return end
+	nvEntries[model] = nil
+	e.highlight:Destroy()
+	e.billboard:Destroy()
+	e.line:Destroy()
+end
+
+local function nvAdd(model: Model)
+	local anchor = nvAnchor(model)
+	if not anchor then return end
+	local e = {}
+	e.highlight = Instance.new("Highlight")
+	e.highlight.Adornee = model
+	e.highlight.FillColor = NV_GREEN
+	e.highlight.OutlineColor = NV_GREEN
+	e.highlight.FillTransparency = 0.45
+	e.highlight.OutlineTransparency = 0
+	e.highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	e.highlight.Parent = nvFolder
+	e.billboard = Instance.new("BillboardGui")
+	e.billboard.Adornee = model:FindFirstChild("Head") or anchor
+	e.billboard.Size = UDim2.fromOffset(220, 40)
+	e.billboard.StudsOffset = Vector3.new(0, 2.6, 0)
+	e.billboard.AlwaysOnTop = true
+	e.billboard.MaxDistance = math.huge
+	e.billboard.Parent = nvFolder
+	e.label = Instance.new("TextLabel")
+	e.label.Size = UDim2.fromScale(1, 1)
+	e.label.BackgroundTransparency = 1
+	e.label.Font = Enum.Font.GothamBold
+	e.label.TextSize = 14
+	e.label.TextColor3 = WHITE
+	e.label.TextStrokeTransparency = 0.3
+	e.label.Parent = e.billboard
+	e.line = Instance.new("Frame")
+	e.line.AnchorPoint = Vector2.new(0.5, 0.5)
+	e.line.BackgroundColor3 = NV_GREEN
+	e.line.BorderSizePixel = 0
+	e.line.Visible = false
+	e.line.Parent = nvGui
+	nvEntries[model] = e
+end
+
+local function nvCollect()
+	local found = {}
+	local myChar = player.Character
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local ch = plr.Character
+		if plr ~= player and ch and ch ~= myChar and ch:FindFirstChildOfClass("Humanoid") then
+			found[ch] = true
+		end
+	end
+	for _, folderName in ipairs(NV_FOLDERS) do
+		local folder = workspace:FindFirstChild(folderName)
+		if folder then
+			for _, d in ipairs(folder:GetDescendants()) do
+				if d:IsA("Model") and d ~= myChar and (d:FindFirstChildOfClass("Humanoid") or d:FindFirstChild("HumanoidRootPart")) then
+					found[d] = true
+				end
+			end
+		end
+	end
+	return found
+end
+
+local function nvScan()
+	local found = nvCollect()
+	for model in pairs(nvEntries) do
+		if not found[model] or not model:IsDescendantOf(workspace) or not nvAnchor(model) then
+			nvRemove(model)
+		end
+	end
+	for model in pairs(found) do
+		if not nvEntries[model] then
+			nvAdd(model)
+		end
+	end
+end
+
+local function nvClear()
+	for model in pairs(nvEntries) do
+		nvRemove(model)
+	end
+end
+
+local function nvUpdate()
+	local cam = workspace.CurrentCamera
+	if not cam then return end
+	local view = cam.ViewportSize
+	local from = Vector2.new(view.X / 2, view.Y)
+	local myChar = player.Character
+	local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+	for model, e in pairs(nvEntries) do
+		local anchor = nvAnchor(model)
+		if not anchor then
+			nvRemove(model)
+		else
+			local dist = myRoot and (anchor.Position - myRoot.Position).Magnitude or (anchor.Position - cam.CFrame.Position).Magnitude
+			e.highlight.Enabled = nv.body
+
+			-- rig custom (kalau opsi Nama Custom ON): body + garis + nama jadi merah
+			local custom = nvIsCustom(model)
+			local tint = (custom and nv.custom) and NV_RED or NV_GREEN
+			e.highlight.FillColor = tint
+			e.highlight.OutlineColor = tint
+			e.line.BackgroundColor3 = tint
+			local parts = {}
+			if nv.name then
+				if custom and nv.custom then
+					table.insert(parts, "Custom")
+				else
+					local plr = Players:GetPlayerFromCharacter(model)
+					table.insert(parts, plr and plr.DisplayName or model.Name)
+				end
+			elseif nv.custom and custom then
+				table.insert(parts, "Custom")
+			end
+			if nv.distance then
+				table.insert(parts, string.format("[%dm]", math.floor(dist + 0.5)))
+			end
+			e.billboard.Enabled = #parts > 0
+			e.label.Text = table.concat(parts, " ")
+			e.label.TextColor3 = (custom and nv.custom) and NV_RED or WHITE
+
+			-- garis dari bawah tengah layar ke target
+			if nv.line then
+				local pos, onScreen = cam:WorldToViewportPoint(anchor.Position)
+				if onScreen and pos.Z > 0 then
+					local to = Vector2.new(pos.X, pos.Y)
+					local delta = to - from
+					e.line.Size = UDim2.fromOffset(delta.Magnitude, 1.5)
+					e.line.Position = UDim2.fromOffset((from.X + to.X) / 2, (from.Y + to.Y) / 2)
+					e.line.Rotation = math.deg(math.atan2(delta.Y, delta.X))
+					e.line.Visible = true
+				else
+					e.line.Visible = false
+				end
+			else
+				e.line.Visible = false
+			end
+		end
+	end
+end
+
+RunService.RenderStepped:Connect(function()
+	if not nv.on then return end
+	if os.clock() - nvLastScan > 0.5 then
+		nvLastScan = os.clock()
+		nvScan()
+	end
+	nvUpdate()
+end)
+
+local nvPage = new("Frame", {
+	Name = "NightPage",
+	Position = UDim2.fromOffset(8, PAGE_TOP),
+	Size = UDim2.new(1, -16, 0, CONTENT_HEIGHT),
+	BackgroundTransparency = 1,
+	Visible = false,
+	ZIndex = 2,
+	Parent = main,
+})
+new("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder, Parent = nvPage })
+
+local nvCard = new("Frame", {
+	Name = "NightCard",
+	Size = UDim2.new(1, 0, 0, 0),
+	AutomaticSize = Enum.AutomaticSize.Y,
+	BackgroundColor3 = P.Card,
+	LayoutOrder = 1,
+	Parent = nvPage,
+})
+corner(nvCard, 10)
+new("UIPadding", {
+	PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 10),
+	PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8),
+	Parent = nvCard,
+})
+new("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder, Parent = nvCard })
+new("TextLabel", {
+	Text = "Night Vision",
+	Size = UDim2.new(1, 0, 0, 24),
+	BackgroundTransparency = 1,
+	Font = FONT,
+	TextSize = 18,
+	TextColor3 = WHITE,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	LayoutOrder = 1,
+	ZIndex = 2,
+	Parent = nvCard,
+})
+new("TextLabel", {
+	Text = "Lihat pemain dan model di folder Workspace (Stalker, Pembunuh, Hidden, dst.) dari balik tembok.",
+	Size = UDim2.new(1, 0, 0, 32),
+	BackgroundTransparency = 1,
+	Font = FONT,
+	TextSize = 12,
+	TextColor3 = WHITE,
+	TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	LayoutOrder = 2,
+	ZIndex = 2,
+	Parent = nvCard,
+})
+local nvMainRefs = glossyButton(nvCard, UDim2.new(1, 0, 0, 42), THEMES.Off, "", 18, { LayoutOrder = 3 })
+local NV_OPTIONS = {
+	{ key = "line", text = "Line" },
+	{ key = "distance", text = "Jarak" },
+	{ key = "name", text = "Nama" },
+	{ key = "custom", text = "Nama Custom" },
+	{ key = "body", text = "Body" },
+}
+local nvOptRefs = {}
+for i, opt in ipairs(NV_OPTIONS) do
+	nvOptRefs[opt.key] = glossyButton(nvCard, UDim2.new(1, 0, 0, 34), THEMES.Off, "", 15, { LayoutOrder = 3 + i })
+end
+
+local function refreshNightVision()
+	nvMainRefs.label.Text = nv.on and "Night Vision: ON" or "Night Vision: OFF"
+	setTheme(nvMainRefs, nv.on and THEMES.Green or THEMES.Off)
+	for _, opt in ipairs(NV_OPTIONS) do
+		local refs = nvOptRefs[opt.key]
+		refs.label.Text = opt.text .. ": " .. (nv[opt.key] and "ON" or "OFF")
+		setTheme(refs, nv[opt.key] and THEMES.Green or THEMES.Off)
+	end
+end
+nvMainRefs.button.Activated:Connect(function()
+	nv.on = not nv.on
+	if nv.on then
+		nvLastScan = 0
+	else
+		nvClear()
+	end
+	refreshNightVision()
+end)
+for _, opt in ipairs(NV_OPTIONS) do
+	nvOptRefs[opt.key].button.Activated:Connect(function()
+		nv[opt.key] = not nv[opt.key]
+		refreshNightVision()
+	end)
+end
+refreshNightVision()
+
+-- Tab Utility | Tema | Emote | Night
+local tabsFrame = new("Frame", {
+	Name = "Tabs",
+	Position = UDim2.fromOffset(8, 58),
+	Size = UDim2.new(1, -16, 0, 34),
+	BackgroundTransparency = 1,
+	ZIndex = 2,
+	Parent = main,
+})
+new("UIListLayout", {
+	FillDirection = Enum.FillDirection.Horizontal,
+	Padding = UDim.new(0, 8),
+	HorizontalAlignment = Enum.HorizontalAlignment.Center,
+	SortOrder = Enum.SortOrder.LayoutOrder,
+	Parent = tabsFrame,
+})
+local tabRefs = {
+	Utility = glossyButton(tabsFrame, UDim2.new(1 / 4, -6, 1, 0), THEMES.Tab, "UTILITY", 13, { LayoutOrder = 1 }),
+	Theme = glossyButton(tabsFrame, UDim2.new(1 / 4, -6, 1, 0), THEMES.TabOff, "TEMA", 13, { LayoutOrder = 2 }),
+	Emote = glossyButton(tabsFrame, UDim2.new(1 / 4, -6, 1, 0), THEMES.TabOff, "EMOTE", 13, { LayoutOrder = 3 }),
+	Night = glossyButton(tabsFrame, UDim2.new(1 / 4, -6, 1, 0), THEMES.TabOff, "NIGHT", 13, { LayoutOrder = 4 }),
+}
+local TAB_THEMES = { Utility = THEMES.Tab, Theme = THEMES.Tab, Emote = THEMES.Tab, Night = THEMES.Tab }
+local currentPage = "Utility"
+
+local function showPage(name: string)
+	currentPage = name
+	content.Visible = name == "Utility"
+	themePage.Visible = name == "Theme"
+	emotePage.Visible = name == "Emote"
+	nvPage.Visible = name == "Night"
+	for tabName, refs in pairs(tabRefs) do
+		setTheme(refs, tabName == name and TAB_THEMES[tabName] or THEMES.TabOff)
+	end
+end
+tabRefs.Utility.button.Activated:Connect(function() showPage("Utility") end)
+tabRefs.Theme.button.Activated:Connect(function() showPage("Theme") end)
+tabRefs.Emote.button.Activated:Connect(function() showPage("Emote") end)
+tabRefs.Night.button.Activated:Connect(function() showPage("Night") end)
+
+-- GUI yang ikut ganti warna saat tema diganti
+table.insert(themeRoots, gui)
+table.insert(themeListeners, refreshUI)
+table.insert(themeListeners, refreshEmoteButtons)
+table.insert(themeListeners, refreshNightVision)
+table.insert(themeListeners, function()
+	showPage(currentPage)
+end)
+
+showPage("Utility")
+
+-- Tombol buka kembali saat panel disembunyikan
+local openRefs = glossyButton(gui, UDim2.fromOffset(110, 40), THEMES.Yellow, "Utility", 18, {
+	AnchorPoint = Vector2.new(0, 0.5),
+	Position = UDim2.new(0, 10, 0.5, 0),
+	Visible = false,
+})
+
+local function setPanelVisible(visible: boolean)
+	main.Visible = visible
+	openRefs.button.Visible = not visible
+end
+closeButton.Activated:Connect(function() setPanelVisible(false) end)
+-- Tombol kecil bisa digeser; kalau habis digeser, lepas klik tidak membuka panel
+local openDragged = false
+do
+	local dragging, dragStart, startPos = false, nil, nil
+	openRefs.button.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			openDragged = false
+			dragStart = input.Position
+			startPos = openRefs.button.Position
+			local endConn
+			endConn = input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+					endConn:Disconnect()
+				end
+			end)
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch) then
+			local delta = input.Position - dragStart
+			if delta.Magnitude > 6 then
+				openDragged = true
+			end
+			if openDragged then
+				openRefs.button.Position = UDim2.new(
+					startPos.X.Scale, startPos.X.Offset + delta.X,
+					startPos.Y.Scale, startPos.Y.Offset + delta.Y
+				)
+			end
+		end
+	end)
+end
+openRefs.button.Activated:Connect(function()
+	if openDragged then
+		openDragged = false
+		return
+	end
+	setPanelVisible(true)
+end)
+
+-- Drag panel lewat Top bar
+do
+	local dragging, dragStart, startPos = false, nil, nil
+	top.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = main.Position
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+				end
+			end)
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch) then
+			local delta = input.Position - dragStart
+			main.Position = UDim2.new(
+				startPos.X.Scale, startPos.X.Offset + delta.X,
+				startPos.Y.Scale, startPos.Y.Offset + delta.Y
+			)
+		end
+	end)
+end
+
+-- Hotkey hide/show panel
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then
+		return
+	end
+	if input.KeyCode == TOGGLE_PANEL_KEY then
+		setPanelVisible(not main.Visible)
+	end
+end)
+
+---------------------------------------------------------------------
+-- INIT
+---------------------------------------------------------------------
+refreshUI()
+if player.Character then
+	task.spawn(onCharacterAdded, player.Character)
+end
